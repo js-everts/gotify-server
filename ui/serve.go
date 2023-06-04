@@ -1,21 +1,77 @@
 package ui
 
 import (
+	"bytes"
+	"embed"
 	"encoding/json"
+	"io"
+	"io/fs"
 	"net/http"
-	"strings"
 
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
-	"github.com/gobuffalo/packr/v2"
 	"github.com/gotify/server/v2/model"
 )
 
-var box = packr.New("ui", "../ui/build")
+//go:embed build
+var uiFS embed.FS
 
 type uiConfig struct {
 	Register bool              `json:"register"`
 	Version  model.VersionInfo `json:"version"`
+}
+
+type handler struct {
+	fs           http.FileSystem
+	indexModTime string
+	indexBytes   []byte
+}
+
+func (h *handler) serveIndex(ctx *gin.Context) {
+	ctx.Header("Last-Modified", h.indexModTime)
+
+	ctx.Data(http.StatusOK, "text/html", h.indexBytes)
+}
+
+func (h *handler) serveOther(ctx *gin.Context) {
+	// the error will either be IsNotExist error or some path related error
+	// which we can treat as not found
+	file, err := h.fs.Open(ctx.Request.URL.Path)
+	if err != nil {
+		ctx.AbortWithStatus(404)
+		return
+	}
+
+	// Stat from embed.FS will never error
+	s, _ := file.Stat()
+	if s.IsDir() {
+		ctx.AbortWithStatus(404)
+		return
+	}
+
+	// ServeContent will set the correct content-type header
+	http.ServeContent(ctx.Writer, ctx.Request, s.Name(), s.ModTime(), file)
+}
+
+func createHandler(uiConfigBytes []byte) *handler {
+	subFS, err := fs.Sub(uiFS, "build")
+	if err != nil {
+		panic(err)
+	}
+
+	// will only return an error if index.html doesn't exist and will cause
+	// io.ReadAll to panic.
+	file, _ := subFS.Open("index.html")
+	idxBytes, _ := io.ReadAll(file)
+	stat, _ := file.Stat()
+
+	idxBytes = bytes.Replace(idxBytes, []byte("%CONFIG%"), uiConfigBytes, 1)
+
+	return &handler{
+		indexBytes:   idxBytes,
+		indexModTime: stat.ModTime().UTC().Format(http.TimeFormat),
+		fs:           http.FS(subFS),
+	}
 }
 
 // Register registers the ui on the root path.
@@ -24,28 +80,14 @@ func Register(r *gin.Engine, version model.VersionInfo, register bool) {
 	if err != nil {
 		panic(err)
 	}
+
+	h := createHandler(uiConfigBytes)
+
 	ui := r.Group("/", gzip.Gzip(gzip.DefaultCompression))
-	ui.GET("/", serveFile("index.html", "text/html", func(content string) string {
-		return strings.Replace(content, "%CONFIG%", string(uiConfigBytes), 1)
-	}))
-	ui.GET("/index.html", serveFile("index.html", "text/html", noop))
-	ui.GET("/manifest.json", serveFile("manifest.json", "application/json", noop))
-	ui.GET("/asset-manifest.json", serveFile("asset-manifest.json", "application/json", noop))
-	ui.GET("/static/*any", gin.WrapH(http.FileServer(box)))
-}
+	ui.GET("/", h.serveIndex)
+	ui.GET("/index.html", h.serveIndex)
 
-func noop(s string) string {
-	return s
-}
-
-func serveFile(name, contentType string, convert func(string) string) gin.HandlerFunc {
-	content, err := box.FindString(name)
-	if err != nil {
-		panic(err)
-	}
-	converted := convert(content)
-	return func(ctx *gin.Context) {
-		ctx.Header("Content-Type", contentType)
-		ctx.String(200, converted)
-	}
+	ui.GET("/manifest.json", h.serveOther)
+	ui.GET("/asset-manifest.json", h.serveOther)
+	ui.GET("/static/*any", h.serveOther)
 }
